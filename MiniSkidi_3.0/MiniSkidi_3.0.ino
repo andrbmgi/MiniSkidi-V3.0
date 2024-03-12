@@ -23,6 +23,7 @@
 #include <ESPAsyncWebSrv.h> // by dvarrel
 #include <iostream>
 #include <sstream>
+#include "sbus.h"
 
 #if defined(ESP32)
 #include <AsyncTCP.h> // by dvarrel
@@ -33,6 +34,9 @@
 
 
 // defines
+#define SERIAL_TX_PIN    17
+#define SERIAL_RX_PIN    16
+
 #define bucketServoPin  23
 #define auxServoPin 22
 #define lightPin1 18
@@ -52,6 +56,10 @@
 #define FORWARD 1
 #define BACKWARD -1
 
+#define MS_CENTER 990
+#define MS_MIN 200
+#define MS_MAX 1780
+#define DEAD_PERCENT 5
 // global constants
 
 extern const char* htmlHomePage PROGMEM;
@@ -61,6 +69,11 @@ const char* ssid     = "ProfBoots MiniSkidi OG";
 
 Servo bucketServo;
 Servo auxServo;
+
+/* SBUS object, reading SBUS */
+bfs::SbusRx sbus_rx(&Serial2, SERIAL_RX_PIN, SERIAL_TX_PIN, true, false);
+/* SBUS data */
+bfs::SbusData data;
 
 bool horizontalScreen;//When screen orientation is locked vertically this rotates the D-Pad controls so that forward would now be left.
 bool removeArmMomentum = false;
@@ -82,6 +95,113 @@ std::vector<MOTOR_PINS> motorPins =
 AsyncWebServer server(80);
 AsyncWebSocket wsCarInput("/CarInput");
 
+long map_ms_percent(int ms_value) {
+  long percent_value = map(ms_value, MS_MIN, MS_MAX, 0, 100);
+  return percent_value;
+}
+
+long map_analog(int ms_value) {
+  long servo_value = map(ms_value, MS_MIN, MS_MAX, 10, 180);
+  return servo_value;
+}
+
+bool is_off(long value) {
+  return value > 50 - DEAD_PERCENT && value < 50 + DEAD_PERCENT;
+}
+
+void perform_remote_command(bfs::SbusData data) {
+  long remote_throttle = map_ms_percent(data.ch[0]);
+  long remote_steering = map_ms_percent(data.ch[1]);
+  long remote_arm = map_ms_percent(data.ch[2]);
+  long remote_bucket = map_analog(data.ch[3]);
+  long remote_aux = map_analog(data.ch[4]);
+  long remote_lights = map_ms_percent(data.ch[5]);
+
+  // Throttle
+  if (!is_off(remote_throttle)) {
+
+    if (is_off(remote_steering)) {
+      // Straight
+      if (remote_throttle > 50 + DEAD_PERCENT) {
+        // Forward
+        rotateMotor(RIGHT_MOTOR, FORWARD);
+        rotateMotor(LEFT_MOTOR, FORWARD);
+      } else if (remote_throttle < 50 - DEAD_PERCENT) {
+        // Backward
+        rotateMotor(RIGHT_MOTOR, BACKWARD);
+        rotateMotor(LEFT_MOTOR, BACKWARD);
+      }
+    } else {
+      // Curve
+      if (remote_throttle > 50 + DEAD_PERCENT) {
+        // Forward
+        if (remote_steering > 50 + DEAD_PERCENT) {
+          // Right
+          rotateMotor(RIGHT_MOTOR, STOP);
+          rotateMotor(LEFT_MOTOR, FORWARD);
+        } else if (remote_steering < 50 - DEAD_PERCENT) {
+          // Left
+          rotateMotor(RIGHT_MOTOR, FORWARD);
+          rotateMotor(LEFT_MOTOR, STOP);
+        }
+      } else if (remote_throttle < 50 - DEAD_PERCENT) {
+        // Backward
+        if (remote_steering > 50 + DEAD_PERCENT) {
+          // Right
+          rotateMotor(RIGHT_MOTOR, STOP);
+          rotateMotor(LEFT_MOTOR, BACKWARD);
+        } else if (remote_steering < 50 - DEAD_PERCENT) {
+          // Left
+          rotateMotor(RIGHT_MOTOR, BACKWARD);
+          rotateMotor(LEFT_MOTOR, STOP);
+        }
+      }
+    }
+  } else {
+    // No throttle
+    if (remote_steering > 50 + DEAD_PERCENT) {
+          // Turn right
+          rotateMotor(RIGHT_MOTOR, BACKWARD);
+          rotateMotor(LEFT_MOTOR, FORWARD);
+        } else if (remote_steering < 50 - DEAD_PERCENT) {
+          // Turn left
+          rotateMotor(RIGHT_MOTOR, FORWARD);
+          rotateMotor(LEFT_MOTOR, BACKWARD);
+        }
+  }
+
+  if (remote_arm > 50 + DEAD_PERCENT) {
+    // Lower
+    removeArmMomentum = true;
+    rotateMotor(ARM_MOTOR, FORWARD);
+  } else if (remote_arm < 50 - DEAD_PERCENT) {
+    // Raise
+    rotateMotor(ARM_MOTOR, BACKWARD);
+  }
+
+  bucketTilt(remote_bucket);
+  auxControl(remote_aux);
+
+  if (is_off(remote_throttle) && 
+      is_off(remote_steering)) {
+    rotateMotor(RIGHT_MOTOR, STOP);
+    rotateMotor(LEFT_MOTOR, STOP);
+  } 
+
+  if (is_off(remote_arm)) {
+    rotateMotor(ARM_MOTOR, STOP);
+  }
+
+  if (remote_lights > 50) {
+    digitalWrite(lightPin1, HIGH);
+    digitalWrite(lightPin2, LOW);
+    light = true;
+  } else {
+    digitalWrite(lightPin1, LOW);
+    digitalWrite(lightPin2, LOW);
+    light = false;
+  }
+}
 
 void rotateMotor(int motorNumber, int motorDirection)
 {
@@ -335,6 +455,9 @@ void setup(void)
   setUpPinModes();
   Serial.begin(115200);
 
+  /* Begin the SBUS communication */
+  sbus_rx.Begin();
+
   WiFi.softAP(ssid );
   IPAddress IP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
@@ -353,5 +476,10 @@ void setup(void)
 
 void loop()
 {
+  /* Grab the received data */
+  if (sbus_rx.Read()) {
+    data = sbus_rx.data();
+    perform_remote_command(data);
+  }
   wsCarInput.cleanupClients();
 }
